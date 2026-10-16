@@ -29,6 +29,9 @@ use std::time::{Duration, Instant};
 use text_embeddings_backend::{DType, Pool};
 use text_embeddings_core::download::{download_artifacts, ST_CONFIG_NAMES};
 use text_embeddings_core::infer::Infer;
+use text_embeddings_core::multimodal::{
+    MultimodalConfig, MultimodalTokens, VideoProcessorConfig, VisionProcessorConfig,
+};
 use text_embeddings_core::queue::Queue;
 use text_embeddings_core::tokenization::Tokenization;
 use text_embeddings_core::TextEmbeddingsError;
@@ -59,12 +62,13 @@ pub async fn run(
     default_prompt: Option<String>,
     default_prompt_name: Option<String>,
     dense_path: Option<String>,
+    disable_vision: bool,
     hf_token: Option<String>,
     hostname: Option<String>,
     port: u16,
     uds_path: Option<String>,
     huggingface_hub_cache: Option<String>,
-    payload_limit: usize,
+    payload_limit: Option<usize>,
     api_key: Option<String>,
     otlp_endpoint: Option<String>,
     otlp_service_name: String,
@@ -132,12 +136,14 @@ pub async fn run(
         text_embeddings_backend::ModelType::Classifier => {
             let id2label = config
                 .id2label
+                .take()
                 .context("`config.json` does not contain `id2label`")?;
             let n_classes = id2label.len();
             let classifier_model = ClassifierModel {
                 id2label,
                 label2id: config
                     .label2id
+                    .take()
                     .context("`config.json` does not contain `label2id`")?,
             };
             if n_classes > 1 {
@@ -269,15 +275,14 @@ pub async fn run(
         default_prompt
     };
 
-    // Tokenization logic
-    let tokenization = Tokenization::new(
-        tokenization_workers,
-        tokenizer,
-        max_input_length,
-        position_offset,
-        default_prompt,
-        prompts,
-    );
+    let multimodal = if disable_vision {
+        if config.vision_config.as_ref().is_some_and(|c| !c.is_null()) {
+            tracing::info!("Image and video inputs are disabled with `--disable-vision`, so the vision encoder won't be loaded");
+        }
+        None
+    } else {
+        get_multimodal_config(&config, &model_root, &tokenizer)?
+    };
 
     // NOTE: `gemma3_text` and `embedding_gemma2` won't support Float16 but only Float32, given
     // that with `candle-cuda` feature, the default `Dtype::Float16` this overrides that to prevent
@@ -298,6 +303,9 @@ pub async fn run(
         dtype.clone(),
         backend_model_type,
         dense_path,
+        // NOTE: The vision encoder is only loaded if the image and video inputs can be
+        // preprocessed, otherwise it would be unused
+        multimodal.is_some(),
         uds_path.unwrap_or("/tmp/text-embeddings-inference-server".to_string()),
         otlp_endpoint.clone(),
         otlp_service_name.clone(),
@@ -308,6 +316,32 @@ pub async fn run(
         .health()
         .await
         .context("Model backend is not healthy")?;
+
+    let multimodal = match multimodal {
+        Some(_) if !backend.supports_images => {
+            tracing::warn!("The model backend does not support image inputs, so only text inputs will be supported");
+            None
+        }
+        multimodal => multimodal,
+    };
+    if multimodal.is_some() {
+        tracing::info!("Image and video inputs are supported");
+    }
+    let payload_limit = payload_limit.unwrap_or(match multimodal {
+        Some(_) => 50_000_000,
+        None => 2_000_000,
+    });
+
+    // Tokenization logic
+    let tokenization = Tokenization::new(
+        tokenization_workers,
+        tokenizer,
+        max_input_length,
+        position_offset,
+        default_prompt,
+        prompts,
+        multimodal,
+    );
 
     tracing::info!("Warming up model");
     backend
@@ -475,6 +509,93 @@ fn get_backend_model_type(
     Ok(text_embeddings_backend::ModelType::Embedding(pool))
 }
 
+/// Builds the preprocessing configuration for the image and video inputs, only for the models
+/// defining a `vision_config` (currently EmbeddingGemma 2)
+fn get_multimodal_config(
+    config: &ModelConfig,
+    model_root: &Path,
+    tokenizer: &Tokenizer,
+) -> Result<Option<MultimodalConfig>> {
+    if config.vision_config.as_ref().is_none_or(|c| c.is_null()) {
+        return Ok(None);
+    }
+    if config.model_type != "embedding_gemma2" {
+        tracing::warn!(
+            "`vision_config` is defined but image inputs are not supported for `{}`",
+            config.model_type
+        );
+        return Ok(None);
+    }
+
+    let processor_config_path = model_root.join("processor_config.json");
+    let processor_config = match fs::read_to_string(&processor_config_path) {
+        Ok(processor_config) => processor_config,
+        Err(err) => {
+            tracing::warn!("Could not read `processor_config.json` ({err}), so image and video inputs won't be supported");
+            return Ok(None);
+        }
+    };
+    let processor_config: ProcessorConfig = serde_json::from_str(&processor_config)
+        .context("Failed to parse `processor_config.json`")?;
+
+    let token = |name: &str, id: Option<u32>| -> Result<String> {
+        let id = id.with_context(|| format!("`{name}` is not defined in `config.json`"))?;
+        tokenizer
+            .id_to_token(id)
+            .with_context(|| format!("`{name}={id}` not found in the tokenizer"))
+    };
+    let tokens = MultimodalTokens {
+        begin_image: token("boi_token_id", config.boi_token_id)?,
+        end_image: token("eoi_token_id", config.eoi_token_id)?,
+        image: token("image_token_id", config.image_token_id)?,
+        video: token("video_token_id", config.video_token_id)?,
+    };
+
+    let image = processor_config.image_processor.into();
+    let video = processor_config
+        .video_processor
+        .map(|video| VideoProcessorConfig {
+            max_frames: video.max_frames,
+            frame: video.processor.into(),
+        });
+
+    Ok(Some(MultimodalConfig {
+        image,
+        video,
+        tokens,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct VisionProcessorConfigJson {
+    patch_size: usize,
+    pooling_kernel_size: usize,
+    max_soft_tokens: usize,
+}
+
+impl From<VisionProcessorConfigJson> for VisionProcessorConfig {
+    fn from(config: VisionProcessorConfigJson) -> Self {
+        Self {
+            patch_size: config.patch_size,
+            pooling_kernel_size: config.pooling_kernel_size,
+            max_soft_tokens: config.max_soft_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoProcessorConfigJson {
+    #[serde(flatten)]
+    processor: VisionProcessorConfigJson,
+    max_frames: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorConfig {
+    image_processor: VisionProcessorConfigJson,
+    video_processor: Option<VideoProcessorConfigJson>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
     pub architectures: Vec<String>,
@@ -491,6 +612,11 @@ pub struct ModelConfig {
     pub label2id: Option<HashMap<String, usize>>,
     pub auto_map: Option<HashMap<String, String>>,
     pub text_config: Option<TextConfig>,
+    pub vision_config: Option<serde_json::Value>,
+    pub boi_token_id: Option<u32>,
+    pub eoi_token_id: Option<u32>,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

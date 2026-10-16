@@ -14,6 +14,18 @@ pub struct Batch {
     pub max_length: u32,
     pub pooled_indices: Vec<u32>,
     pub raw_indices: Vec<u32>,
+    /// Images (or video frames) for multimodal models, in the same order as their runs of
+    /// placeholder tokens appear within `input_ids`
+    pub images: Vec<BatchImage>,
+}
+
+/// An image (or video frame) already decoded and resized, stored as RGB `u8` values in
+/// height-width-channel layout
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchImage {
+    pub height: usize,
+    pub width: usize,
+    pub pixels: Vec<u8>,
 }
 
 impl Batch {
@@ -41,6 +53,11 @@ pub trait Backend {
     }
 
     fn is_padded(&self) -> bool;
+
+    /// Whether `Batch::images` are supported i.e. the model has a loaded vision encoder
+    fn supports_images(&self) -> bool {
+        false
+    }
 
     fn embed(&self, batch: Batch) -> Result<Embeddings, BackendError>;
 

@@ -5,7 +5,7 @@ use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Embedding, Module, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
-use text_embeddings_backend_core::{Batch, ModelType, Pool};
+use text_embeddings_backend_core::{Batch, BatchImage, ModelType, Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +47,29 @@ pub struct EmbeddingGemma2TextConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EmbeddingGemma2Config {
     pub text_config: EmbeddingGemma2TextConfig,
+    pub vision_config: Option<EmbeddingGemma2VisionConfig>,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EmbeddingGemma2VisionConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub num_hidden_layers: usize,
+    pub head_dim: usize,
+    pub hidden_activation: HiddenAct,
+    pub rms_norm_eps: f32,
+    pub rope_parameters: RopeParameters,
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub position_embedding_size: usize,
+    #[serde(default)]
+    pub use_clipped_linears: bool,
+    #[serde(default)]
+    pub standardize: bool,
 }
 
 impl EmbeddingGemma2TextConfig {
@@ -574,6 +597,430 @@ impl EmbeddingGemma2Rotary {
     }
 }
 
+/// Loads a vision linear weight, which may be nested under `linear` as the Gemma 4 vision tower
+/// wraps those to optionally clip their inputs and outputs
+fn vision_linear_weight(vb: VarBuilder, out_dim: usize, in_dim: usize) -> Result<Tensor> {
+    let vb = if vb.contains_tensor("linear.weight") {
+        vb.pp("linear")
+    } else {
+        vb
+    };
+    vb.get((out_dim, in_dim), "weight")
+}
+
+fn load_vision_linear(vb: VarBuilder, out_dim: usize, in_dim: usize) -> Result<Linear> {
+    Ok(Linear::new(
+        vision_linear_weight(vb, out_dim, in_dim)?,
+        None,
+        None,
+    ))
+}
+
+struct EmbeddingGemma2VisionAttention {
+    qkv_proj: Linear,
+    o_proj: Linear,
+
+    q_norm: EmbeddingGemma2RMSNorm,
+    k_norm: EmbeddingGemma2RMSNorm,
+    v_norm: EmbeddingGemma2RMSNorm,
+
+    num_attention_heads: usize,
+    attention_head_size: usize,
+
+    span: tracing::Span,
+}
+
+impl EmbeddingGemma2VisionAttention {
+    pub fn load(vb: VarBuilder, config: &EmbeddingGemma2VisionConfig) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let all_head_size = config.num_attention_heads * config.head_dim;
+
+        let qkv_weight = Tensor::cat(
+            &[
+                vision_linear_weight(vb.pp("q_proj"), all_head_size, hidden_size)?,
+                vision_linear_weight(vb.pp("k_proj"), all_head_size, hidden_size)?,
+                vision_linear_weight(vb.pp("v_proj"), all_head_size, hidden_size)?,
+            ],
+            0,
+        )?;
+
+        Ok(Self {
+            qkv_proj: Linear::new(qkv_weight, None, None),
+            o_proj: load_vision_linear(vb.pp("o_proj"), hidden_size, all_head_size)?,
+            q_norm: EmbeddingGemma2RMSNorm::load(
+                vb.pp("q_norm"),
+                config.head_dim,
+                config.rms_norm_eps,
+            )?,
+            k_norm: EmbeddingGemma2RMSNorm::load(
+                vb.pp("k_norm"),
+                config.head_dim,
+                config.rms_norm_eps,
+            )?,
+            v_norm: EmbeddingGemma2RMSNorm::without_scale(config.rms_norm_eps),
+            num_attention_heads: config.num_attention_heads,
+            attention_head_size: config.head_dim,
+            span: tracing::span!(tracing::Level::TRACE, "vision_attention"),
+        })
+    }
+
+    /// Applies the axial 2D RoPE, rotating the first half of each head by the column (`x`) and
+    /// the second half by the row (`y`) of each patch
+    fn apply_axial_rotary(
+        &self,
+        x: &Tensor,
+        cos_sin: &EmbeddingGemma2VisionCosSin,
+    ) -> Result<Tensor> {
+        let half = self.attention_head_size / 2;
+        let x_rot = apply_rotary(
+            &x.narrow(D::Minus1, 0, half)?,
+            &cos_sin.cos_x,
+            &cos_sin.sin_x,
+            half,
+        )?;
+        let y_rot = apply_rotary(
+            &x.narrow(D::Minus1, half, half)?,
+            &cos_sin.cos_y,
+            &cos_sin.sin_y,
+            half,
+        )?;
+        Tensor::cat(&[&x_rot, &y_rot], D::Minus1)
+    }
+
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        cos_sin: &EmbeddingGemma2VisionCosSin,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        let (num_patches, _) = hidden_states.dims2()?;
+        let all_head_size = self.num_attention_heads * self.attention_head_size;
+        let shape = (
+            num_patches,
+            self.num_attention_heads,
+            self.attention_head_size,
+        );
+
+        let qkv = self.qkv_proj.forward(hidden_states)?;
+        let q = qkv.narrow(D::Minus1, 0, all_head_size)?.reshape(shape)?;
+        let k = qkv
+            .narrow(D::Minus1, all_head_size, all_head_size)?
+            .reshape(shape)?;
+        let v = qkv
+            .narrow(D::Minus1, 2 * all_head_size, all_head_size)?
+            .reshape(shape)?;
+
+        // [num_heads, num_patches, head_dim]
+        let q = self.q_norm.forward(&q)?.transpose(0, 1)?;
+        let k = self.k_norm.forward(&k)?.transpose(0, 1)?;
+        let v = self.v_norm.forward(&v)?.transpose(0, 1)?.contiguous()?;
+
+        let q = self.apply_axial_rotary(&q, cos_sin)?;
+        let k = self.apply_axial_rotary(&k, cos_sin)?;
+
+        // NOTE: The attention scaling is 1.0, as the queries and keys are already RMS-normalized,
+        // and the attention is bidirectional with no masking, as images are encoded one at a time
+        let attn_weights = q.matmul(&k.t()?)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let context_layer = attn_weights.matmul(&v)?;
+
+        let context_layer = context_layer.transpose(0, 1)?.flatten_from(D::Minus2)?;
+        self.o_proj.forward(&context_layer)
+    }
+}
+
+struct EmbeddingGemma2VisionMLP {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    hidden_activation: HiddenAct,
+
+    span: tracing::Span,
+}
+
+impl EmbeddingGemma2VisionMLP {
+    pub fn load(vb: VarBuilder, config: &EmbeddingGemma2VisionConfig) -> Result<Self> {
+        Ok(Self {
+            gate_proj: load_vision_linear(
+                vb.pp("gate_proj"),
+                config.intermediate_size,
+                config.hidden_size,
+            )?,
+            up_proj: load_vision_linear(
+                vb.pp("up_proj"),
+                config.intermediate_size,
+                config.hidden_size,
+            )?,
+            down_proj: load_vision_linear(
+                vb.pp("down_proj"),
+                config.hidden_size,
+                config.intermediate_size,
+            )?,
+            hidden_activation: config.hidden_activation.clone(),
+            span: tracing::span!(tracing::Level::TRACE, "vision_mlp"),
+        })
+    }
+
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        let gate_states = self
+            .hidden_activation
+            .forward(&self.gate_proj.forward(hidden_states)?)?;
+        let up_states = self.up_proj.forward(hidden_states)?;
+        self.down_proj.forward(&(gate_states * up_states)?)
+    }
+}
+
+struct EmbeddingGemma2VisionLayer {
+    input_layernorm: EmbeddingGemma2RMSNorm,
+    self_attn: EmbeddingGemma2VisionAttention,
+    post_attention_layernorm: EmbeddingGemma2RMSNorm,
+
+    pre_feedforward_layernorm: EmbeddingGemma2RMSNorm,
+    mlp: EmbeddingGemma2VisionMLP,
+    post_feedforward_layernorm: EmbeddingGemma2RMSNorm,
+
+    span: tracing::Span,
+}
+
+impl EmbeddingGemma2VisionLayer {
+    pub fn load(vb: VarBuilder, config: &EmbeddingGemma2VisionConfig) -> Result<Self> {
+        let norm = |name: &str| {
+            EmbeddingGemma2RMSNorm::load(vb.pp(name), config.hidden_size, config.rms_norm_eps)
+        };
+
+        Ok(Self {
+            input_layernorm: norm("input_layernorm")?,
+            self_attn: EmbeddingGemma2VisionAttention::load(vb.pp("self_attn"), config)?,
+            post_attention_layernorm: norm("post_attention_layernorm")?,
+            pre_feedforward_layernorm: norm("pre_feedforward_layernorm")?,
+            mlp: EmbeddingGemma2VisionMLP::load(vb.pp("mlp"), config)?,
+            post_feedforward_layernorm: norm("post_feedforward_layernorm")?,
+            span: tracing::span!(tracing::Level::TRACE, "vision_layer"),
+        })
+    }
+
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        cos_sin: &EmbeddingGemma2VisionCosSin,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        let attn_states = self.input_layernorm.forward(hidden_states)?;
+        let attn_states = self.self_attn.forward(&attn_states, cos_sin)?;
+        let attn_states = self.post_attention_layernorm.forward(&attn_states)?;
+        let hidden_states = (hidden_states + attn_states)?;
+
+        let mlp_states = self.pre_feedforward_layernorm.forward(&hidden_states)?;
+        let mlp_states = self.mlp.forward(&mlp_states)?;
+        let mlp_states = self.post_feedforward_layernorm.forward(&mlp_states)?;
+        hidden_states + mlp_states
+    }
+}
+
+struct EmbeddingGemma2VisionCosSin {
+    cos_x: Tensor,
+    sin_x: Tensor,
+    cos_y: Tensor,
+    sin_y: Tensor,
+}
+
+/// The Gemma 4 vision tower, followed by the multimodal embedder that projects the soft tokens
+/// into the text model space
+struct EmbeddingGemma2Vision {
+    input_proj: Linear,
+    position_embedding_x: Tensor,
+    position_embedding_y: Tensor,
+    layers: Vec<EmbeddingGemma2VisionLayer>,
+    inv_freqs: Tensor,
+
+    embedding_pre_projection_norm: EmbeddingGemma2RMSNorm,
+    embedding_projection: Linear,
+
+    hidden_size: usize,
+    patch_size: usize,
+    pooling_kernel_size: usize,
+    position_embedding_size: usize,
+
+    device: Device,
+    dtype: DType,
+
+    span: tracing::Span,
+}
+
+impl EmbeddingGemma2Vision {
+    pub fn load(
+        vision_tower_vb: VarBuilder,
+        embed_vision_vb: VarBuilder,
+        config: &EmbeddingGemma2VisionConfig,
+        text_hidden_size: usize,
+    ) -> Result<Self> {
+        if config.use_clipped_linears {
+            candle::bail!("`use_clipped_linears=true` is not supported for EmbeddingGemma2");
+        }
+        if config.standardize {
+            candle::bail!("`standardize=true` is not supported for EmbeddingGemma2");
+        }
+        if config.num_key_value_heads != config.num_attention_heads {
+            candle::bail!(
+                "Grouped-query attention is not supported in the EmbeddingGemma2 vision tower"
+            );
+        }
+
+        let patch_dim = config.patch_size * config.patch_size * 3;
+        let vb = vision_tower_vb.pp("patch_embedder");
+        let input_proj = load_vision_linear(vb.pp("input_proj"), config.hidden_size, patch_dim)?;
+        let position_embedding_table = vb.get(
+            (2, config.position_embedding_size, config.hidden_size),
+            "position_embedding_table",
+        )?;
+
+        let layers = (0..config.num_hidden_layers)
+            .map(|i| {
+                EmbeddingGemma2VisionLayer::load(
+                    vision_tower_vb.pp(format!("encoder.layers.{i}")),
+                    config,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // NOTE: Each half of the head dimension is rotated along one of the two spatial axes
+        let inv_freqs = get_inv_freqs(
+            config.head_dim / 2,
+            config.rope_parameters.rope_theta,
+            vision_tower_vb.device(),
+            None,
+        )?;
+
+        let embedding_projection = Linear::new(
+            embed_vision_vb
+                .pp("embedding_projection")
+                .get((text_hidden_size, config.hidden_size), "weight")?,
+            None,
+            None,
+        );
+
+        Ok(Self {
+            input_proj,
+            position_embedding_x: position_embedding_table.get(0)?,
+            position_embedding_y: position_embedding_table.get(1)?,
+            layers,
+            inv_freqs,
+            embedding_pre_projection_norm: EmbeddingGemma2RMSNorm::without_scale(
+                config.rms_norm_eps,
+            ),
+            embedding_projection,
+            hidden_size: config.hidden_size,
+            patch_size: config.patch_size,
+            pooling_kernel_size: config.pooling_kernel_size,
+            position_embedding_size: config.position_embedding_size,
+            device: vision_tower_vb.device().clone(),
+            dtype: vision_tower_vb.dtype(),
+            span: tracing::span!(tracing::Level::TRACE, "vision"),
+        })
+    }
+
+    fn cos_sin(&self, positions: Vec<u32>) -> Result<(Tensor, Tensor)> {
+        let num_positions = positions.len();
+        let positions =
+            Tensor::from_vec(positions, (num_positions, 1), &self.device)?.to_dtype(DType::F32)?;
+        let freqs = positions.matmul(&self.inv_freqs)?;
+        let freqs = Tensor::cat(&[&freqs, &freqs], 1)?;
+        Ok((
+            freqs.cos()?.to_dtype(self.dtype)?,
+            freqs.sin()?.to_dtype(self.dtype)?,
+        ))
+    }
+
+    /// Encodes a single image into `[num_soft_tokens, text_hidden_size]` soft tokens
+    pub fn forward(&self, image: &BatchImage) -> Result<Tensor> {
+        let _enter = self.span.enter();
+
+        let side = self.patch_size * self.pooling_kernel_size;
+        if image.height == 0
+            || image.width == 0
+            || image.height % side != 0
+            || image.width % side != 0
+            || image.pixels.len() != image.height * image.width * 3
+        {
+            candle::bail!(
+                "Images are expected to be RGB with a non-zero height and width multiple of {side}, but got {}x{} with {} values",
+                image.height,
+                image.width,
+                image.pixels.len()
+            );
+        }
+
+        let rows = image.height / self.patch_size;
+        let cols = image.width / self.patch_size;
+        if rows.max(cols) > self.position_embedding_size {
+            candle::bail!(
+                "Image of {}x{} exceeds the maximum number of positions",
+                image.height,
+                image.width
+            );
+        }
+        let num_patches = rows * cols;
+
+        // Patchify in row-major order, flattening each patch in height-width-channel order
+        let pixel_values =
+            Tensor::from_slice(&image.pixels, image.height * image.width * 3, &self.device)?
+                .to_dtype(DType::F32)?;
+        let pixel_values = (pixel_values * (1.0 / 255.0))?
+            .reshape((rows, self.patch_size, cols, self.patch_size, 3))?
+            .permute((0, 2, 1, 3, 4))?
+            .reshape((num_patches, self.patch_size * self.patch_size * 3))?;
+        // NOTE: Pixels are rescaled to [-1, 1] within the patch embedder
+        let pixel_values = ((pixel_values - 0.5)? * 2.0)?.to_dtype(self.dtype)?;
+
+        let xs = (0..num_patches)
+            .map(|i| (i % cols) as u32)
+            .collect::<Vec<_>>();
+        let ys = (0..num_patches)
+            .map(|i| (i / cols) as u32)
+            .collect::<Vec<_>>();
+        let xs_tensor = Tensor::from_slice(&xs, num_patches, &self.device)?;
+        let ys_tensor = Tensor::from_slice(&ys, num_patches, &self.device)?;
+
+        let mut hidden_states = self.input_proj.forward(&pixel_values)?;
+        hidden_states = (hidden_states + self.position_embedding_x.index_select(&xs_tensor, 0)?)?;
+        hidden_states = (hidden_states + self.position_embedding_y.index_select(&ys_tensor, 0)?)?;
+
+        let (cos_x, sin_x) = self.cos_sin(xs)?;
+        let (cos_y, sin_y) = self.cos_sin(ys)?;
+        let cos_sin = EmbeddingGemma2VisionCosSin {
+            cos_x,
+            sin_x,
+            cos_y,
+            sin_y,
+        };
+
+        for layer in &self.layers {
+            hidden_states = layer.forward(&hidden_states, &cos_sin)?;
+        }
+
+        // Average pool every `pooling_kernel_size x pooling_kernel_size` block of patches, in
+        // row-major order over the pooled grid, then scale by `sqrt(hidden_size)`
+        let k = self.pooling_kernel_size;
+        let soft_tokens = hidden_states
+            .to_dtype(DType::F32)?
+            .reshape((rows / k, k, cols / k, k, self.hidden_size))?
+            .mean(3)?
+            .mean(1)?
+            .reshape(((rows / k) * (cols / k), self.hidden_size))?;
+        let soft_tokens = (soft_tokens * (self.hidden_size as f64).sqrt())?;
+
+        let soft_tokens = self
+            .embedding_pre_projection_norm
+            .forward(&soft_tokens)?
+            .to_dtype(self.dtype)?;
+        self.embedding_projection.forward(&soft_tokens)
+    }
+}
+
 pub struct EmbeddingGemma2Model {
     embed_tokens: Embedding,
     embed_scale: f64,
@@ -581,6 +1028,10 @@ pub struct EmbeddingGemma2Model {
     layers: Vec<EmbeddingGemma2Layer>,
     norm: EmbeddingGemma2RMSNorm,
     embedding_projection: Linear,
+
+    vision: Option<EmbeddingGemma2Vision>,
+    /// Token ids whose positions are replaced by the soft tokens of the images or video frames
+    multimodal_token_ids: Vec<u32>,
 
     rotary: HashMap<EmbeddingGemma2LayerType, EmbeddingGemma2Rotary>,
     sliding_window: usize,
@@ -595,11 +1046,14 @@ pub struct EmbeddingGemma2Model {
 }
 
 impl EmbeddingGemma2Model {
+    /// Loads the model, including the vision tower if `load_vision` is set and the model has one
     pub fn load(
         vb: VarBuilder,
         config: &EmbeddingGemma2Config,
         model_type: ModelType,
+        load_vision: bool,
     ) -> Result<Self> {
+        let multimodal_config = config;
         let config = &config.text_config;
 
         let pool = match model_type {
@@ -612,12 +1066,30 @@ impl EmbeddingGemma2Model {
             ModelType::Embedding(pool) => pool,
         };
 
-        let vb = if vb.contains_tensor("language_model.embed_tokens.weight") {
-            vb.pp("language_model")
+        let (vb, vision) = if vb.contains_tensor("language_model.embed_tokens.weight") {
+            let vision = match load_vision {
+                true => Self::load_vision(&vb, multimodal_config)?,
+                false => None,
+            };
+            (vb.pp("language_model"), vision)
         } else if vb.contains_tensor("model.language_model.embed_tokens.weight") {
-            vb.pp("model.language_model")
+            let vision = match load_vision {
+                true => Self::load_vision(&vb.pp("model"), multimodal_config)?,
+                false => None,
+            };
+            (vb.pp("model.language_model"), vision)
         } else {
-            vb
+            (vb, None)
+        };
+        let multimodal_token_ids = match vision {
+            Some(_) => [
+                multimodal_config.image_token_id,
+                multimodal_config.video_token_id,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            None => vec![],
         };
 
         let embed_tokens = Embedding::new(
@@ -689,6 +1161,8 @@ impl EmbeddingGemma2Model {
             layers,
             norm,
             embedding_projection,
+            vision,
+            multimodal_token_ids,
             rotary,
             sliding_window: config.sliding_window,
             pad_token_id: config.pad_token_id.unwrap_or(0),
@@ -697,6 +1171,51 @@ impl EmbeddingGemma2Model {
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
+    }
+
+    /// Loads the vision tower if the `vision_config` is defined and its weights are available, as
+    /// those are optional e.g. the model may have been saved without them
+    fn load_vision(
+        vb: &VarBuilder,
+        config: &EmbeddingGemma2Config,
+    ) -> Result<Option<EmbeddingGemma2Vision>> {
+        let Some(vision_config) = &config.vision_config else {
+            return Ok(None);
+        };
+        if !vb.contains_tensor("vision_tower.patch_embedder.input_proj.weight")
+            && !vb.contains_tensor("vision_tower.patch_embedder.input_proj.linear.weight")
+        {
+            tracing::warn!("`vision_config` is defined but the vision tower weights were not found, so only text inputs will be supported");
+            return Ok(None);
+        }
+        if config.image_token_id.is_none() && config.video_token_id.is_none() {
+            candle::bail!(
+                "`vision_config` is defined but neither `image_token_id` nor `video_token_id` are"
+            );
+        }
+
+        EmbeddingGemma2Vision::load(
+            vb.pp("vision_tower"),
+            vb.pp("embed_vision"),
+            vision_config,
+            config.text_config.hidden_size,
+        )
+        .map(Some)
+    }
+
+    /// Encodes all the images and video frames, returning their soft tokens concatenated in order
+    fn embed_images(&self, images: &[BatchImage]) -> Result<Option<Tensor>> {
+        if images.is_empty() {
+            return Ok(None);
+        }
+        let Some(vision) = &self.vision else {
+            candle::bail!("Image inputs are not supported as the vision tower is not loaded");
+        };
+        let soft_tokens = images
+            .iter()
+            .map(|image| vision.forward(image))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&soft_tokens, 0).map(Some)
     }
 
     /// Creates the additive attention bias with shape `[batch_size, 1, seq_len, seq_len]`, or
@@ -757,17 +1276,34 @@ impl EmbeddingGemma2Model {
         let mut position_ids = Vec::with_capacity(batch_size * max_length);
         let mut input_lengths = Vec::with_capacity(batch_size);
 
+        // Index into the token embeddings followed by the soft tokens, so that the placeholder
+        // tokens are replaced by the soft tokens, in order
+        let num_positions = batch_size * max_length;
+        let mut gather_indices = Vec::with_capacity(num_positions);
+        let mut num_placeholders = 0;
+
         for i in 0..batch_size {
             let start = batch.cumulative_seq_lengths[i] as usize;
             let end = batch.cumulative_seq_lengths[i + 1] as usize;
             input_lengths.push(end - start);
 
-            input_ids.extend_from_slice(&batch.input_ids[start..end]);
+            for &input_id in &batch.input_ids[start..end] {
+                if self.multimodal_token_ids.contains(&input_id) {
+                    // NOTE: Placeholders are embedded as padding as those are overwritten anyway
+                    input_ids.push(self.pad_token_id);
+                    gather_indices.push((num_positions + num_placeholders) as u32);
+                    num_placeholders += 1;
+                } else {
+                    input_ids.push(input_id);
+                    gather_indices.push(gather_indices.len() as u32);
+                }
+            }
             position_ids.extend_from_slice(&batch.position_ids[start..end]);
 
             for _ in (end - start)..max_length {
                 input_ids.push(self.pad_token_id);
                 position_ids.push(0);
+                gather_indices.push(gather_indices.len() as u32);
             }
         }
 
@@ -775,7 +1311,32 @@ impl EmbeddingGemma2Model {
         let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
         let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
 
-        let hidden_states = (self.embed_tokens.forward(&input_ids)? * self.embed_scale)?;
+        let mut hidden_states = (self.embed_tokens.forward(&input_ids)? * self.embed_scale)?;
+
+        if let Some(soft_tokens) = self.embed_images(&batch.images)? {
+            let num_soft_tokens = soft_tokens.dim(0)?;
+            if num_soft_tokens != num_placeholders {
+                candle::bail!("The images produce {num_soft_tokens} soft tokens but the inputs contain {num_placeholders} placeholder tokens");
+            }
+            // NOTE: Unlike the token embeddings, the soft tokens are not scaled by `embed_scale`
+            let hidden_size = hidden_states.dim(D::Minus1)?;
+            let gather_indices = Tensor::from_vec(gather_indices, num_positions, &self.device)?;
+            hidden_states = Tensor::cat(
+                &[
+                    &hidden_states.reshape((num_positions, hidden_size))?,
+                    &soft_tokens,
+                ],
+                0,
+            )?
+            .index_select(&gather_indices, 0)?
+            .reshape((batch_size, max_length, hidden_size))?;
+        } else if num_placeholders > 0 {
+            candle::bail!(
+                "The inputs contain {num_placeholders} image placeholder tokens but no images"
+            );
+        }
+
+        // NOTE: The per-layer inputs are computed from the embeddings including the soft tokens
         let per_layer_inputs = self.ple.forward(&hidden_states)?;
 
         let mut cos_sin = HashMap::new();
@@ -849,6 +1410,10 @@ impl EmbeddingGemma2Model {
 impl Model for EmbeddingGemma2Model {
     fn is_padded(&self) -> bool {
         true
+    }
+
+    fn supports_images(&self) -> bool {
+        self.vision.is_some()
     }
 
     fn embed(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {

@@ -168,6 +168,18 @@ impl CandleBackend {
         model_type: ModelType,
         dense_paths: Option<Vec<String>>,
     ) -> Result<Self, BackendError> {
+        Self::new_with_vision(model_path, dtype, model_type, dense_paths, true)
+    }
+
+    /// Same as `new`, but `load_vision=false` skips loading the vision encoder of multimodal
+    /// models, so that those only support text inputs
+    pub fn new_with_vision(
+        model_path: &Path,
+        dtype: String,
+        model_type: ModelType,
+        dense_paths: Option<Vec<String>>,
+        load_vision: bool,
+    ) -> Result<Self, BackendError> {
         // Default files
         let default_safetensors = model_path.join("model.safetensors");
         let default_pytorch = model_path.join("pytorch_model.bin");
@@ -331,7 +343,7 @@ impl CandleBackend {
                 } else {
                     tracing::info!("Starting EmbeddingGemma2 model on {:?}", device);
                     Ok(Box::new(
-                        EmbeddingGemma2Model::load(vb, &config, model_type).s()?,
+                        EmbeddingGemma2Model::load(vb, &config, model_type, load_vision).s()?,
                     ))
                 }
             }
@@ -478,7 +490,7 @@ impl CandleBackend {
                 } else {
                     tracing::info!("Starting EmbeddingGemma2 model on {:?}", device);
                     Ok(Box::new(
-                        EmbeddingGemma2Model::load(vb, &config, model_type).s()?,
+                        EmbeddingGemma2Model::load(vb, &config, model_type, load_vision).s()?,
                     ))
                 }
             }
@@ -678,6 +690,10 @@ impl Backend for CandleBackend {
 
     fn health(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    fn supports_images(&self) -> bool {
+        self.model.supports_images()
     }
 
     fn is_padded(&self) -> bool {

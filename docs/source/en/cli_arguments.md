@@ -133,6 +133,13 @@ Options:
 
           [env: DENSE_PATH=]
 
+      --disable-vision
+          Disable the image and video inputs of multimodal embedding models e.g. `google/embeddinggemma-2`, so that only text inputs are supported.
+
+          The vision encoder is then not loaded, reducing the memory usage.
+
+          [env: DISABLE_VISION=]
+
       --hf-token <HF_TOKEN>
           Your Hugging Face Hub token. If neither `--hf-token` nor `HF_TOKEN` are set, the token will be read from the `$HF_HOME/token` path, if it exists. This ensures access to private or gated models, and allows for a more permissive rate limiting
 
@@ -164,10 +171,9 @@ Options:
       --payload-limit <PAYLOAD_LIMIT>
           Payload size limit in bytes
 
-          Default is 2MB
+          Default is 2MB, or 50MB for models supporting image and video inputs
 
           [env: PAYLOAD_LIMIT=]
-          [default: 2000000]
 
       --api-key <API_KEY>
           Set an api key for request authorization.

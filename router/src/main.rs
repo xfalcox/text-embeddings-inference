@@ -131,6 +131,13 @@ struct Args {
     #[clap(long, env)]
     dense_path: Option<String>,
 
+    /// Disable the image and video inputs of multimodal embedding models e.g.
+    /// `google/embeddinggemma-2`, so that only text inputs are supported.
+    ///
+    /// The vision encoder is then not loaded, reducing the memory usage.
+    #[clap(long, env)]
+    disable_vision: bool,
+
     /// [DEPRECATED IN FAVOR OF `--hf-token`] Your Hugging Face Hub token
     #[clap(long, env, hide = true)]
     #[redact(partial)]
@@ -163,9 +170,9 @@ struct Args {
 
     /// Payload size limit in bytes
     ///
-    /// Default is 2MB
-    #[clap(default_value = "2000000", long, env)]
-    payload_limit: usize,
+    /// Default is 2MB, or 50MB for models supporting image and video inputs
+    #[clap(long, env)]
+    payload_limit: Option<usize>,
 
     /// Set an api key for request authorization.
     ///
@@ -255,6 +262,7 @@ async fn main() -> Result<()> {
         args.default_prompt,
         args.default_prompt_name,
         args.dense_path,
+        args.disable_vision,
         token,
         Some(args.hostname),
         args.port,

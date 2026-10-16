@@ -7,7 +7,9 @@ homepage.workspace = true
 
 [dependencies]
 async-channel = "^2.3"
+base64 = "0.22.1"
 hf-hub = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 metrics = { workspace = true }
 serde_json = { workspace = true }
 text-embeddings-backend = { path = "../backends" }

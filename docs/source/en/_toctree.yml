@@ -23,6 +23,8 @@
     title: Using TEI on AMD Instinct GPUs (ROCm)
   - local: examples
     title: Example uses
+  - local: image_and_video_inputs
+    title: Image and video inputs
   title: Tutorials
 - sections:
   - local: tei_cloud_run

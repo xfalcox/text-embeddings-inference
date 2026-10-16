@@ -1,13 +1,14 @@
 /// HTTP Server logic
 use crate::http::types::{
-    DecodeRequest, DecodeResponse, EmbedAllRequest, EmbedAllResponse, EmbedRequest, EmbedResponse,
-    EmbedSparseRequest, EmbedSparseResponse, Embedding, EncodingFormat, Input, InputIds, InputType,
+    Content, DecodeRequest, DecodeResponse, EmbedAllRequest, EmbedAllResponse, EmbedRequest,
+    EmbedResponse, EmbedSparseRequest, EmbedSparseResponse, Embedding, EncodingFormat,
+    ImageContent, Input, InputIds, InputType, MultimodalContent, MultimodalInput,
     OpenAICompatEmbedding, OpenAICompatErrorResponse, OpenAICompatRequest, OpenAICompatResponse,
     OpenAICompatUsage, PredictInput, PredictRequest, PredictResponse, Prediction, Rank,
     RerankRequest, RerankResponse, Sequence, SimilarityInput, SimilarityParameters,
-    SimilarityRequest, SimilarityResponse, SimpleToken, SparseValue, TokenizeInput,
+    SimilarityRequest, SimilarityResponse, SimpleToken, SparseValue, TextContent, TokenizeInput,
     TokenizeRequest, TokenizeResponse, TruncationDirection, VertexPrediction, VertexRequest,
-    VertexResponse,
+    VertexResponse, VideoContent,
 };
 use crate::{
     logging, shutdown, ClassifierModel, EmbeddingModel, ErrorResponse, ErrorType, Info, ModelType,
@@ -1687,6 +1688,12 @@ pub async fn run(
     SimilarityResponse,
     SimpleToken,
     InputType,
+    MultimodalInput,
+    MultimodalContent,
+    Content,
+    TextContent,
+    ImageContent,
+    VideoContent,
     InputIds,
     DecodeRequest,
     DecodeResponse,

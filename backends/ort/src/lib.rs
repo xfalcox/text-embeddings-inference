@@ -400,6 +400,11 @@ impl Backend for OrtBackend {
     }
 
     fn embed(&self, batch: Batch) -> Result<Embeddings, BackendError> {
+        if !batch.images.is_empty() {
+            return Err(BackendError::Inference(
+                "Image and video inputs are only supported with the Candle backend".to_string(),
+            ));
+        }
         let batch_size = batch.len();
         let max_length = batch.max_length as usize;
 
@@ -692,6 +697,11 @@ impl Backend for OrtBackend {
     }
 
     fn predict(&self, batch: Batch) -> Result<Predictions, BackendError> {
+        if !batch.images.is_empty() {
+            return Err(BackendError::Inference(
+                "Image and video inputs are only supported with the Candle backend".to_string(),
+            ));
+        }
         let batch_size = batch.len();
 
         let (model_inputs, _) = self.prepare_inputs(&batch, &self.tokenizer_config.padding_side)?;

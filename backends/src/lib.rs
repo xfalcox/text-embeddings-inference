@@ -13,7 +13,7 @@ use tracing::{instrument, Span};
 
 use text_embeddings_backend_core::{Backend as CoreBackend, Predictions};
 pub use text_embeddings_backend_core::{
-    BackendError, Batch, Embedding, Embeddings, ModelType, Pool,
+    BackendError, Batch, BatchImage, Embedding, Embeddings, ModelType, Pool,
 };
 
 mod dtype;
@@ -83,6 +83,7 @@ pub struct Backend {
     health_receiver: watch::Receiver<bool>,
     _backend_thread: Arc<BackendThread>,
     pub padded_model: bool,
+    pub supports_images: bool,
     pub max_batch_size: Option<usize>,
     pub model_type: ModelType,
 }
@@ -95,6 +96,7 @@ impl Backend {
         dtype: DType,
         model_type: ModelType,
         dense_path: Option<String>,
+        load_vision: bool,
         uds_path: String,
         otlp_endpoint: Option<String>,
         otlp_service_name: String,
@@ -107,12 +109,14 @@ impl Backend {
             dtype,
             model_type.clone(),
             dense_path,
+            load_vision,
             uds_path,
             otlp_endpoint,
             otlp_service_name,
         )
         .await?;
         let padded_model = backend.is_padded();
+        let supports_images = backend.supports_images();
         let max_batch_size = backend.max_batch_size();
 
         let (health_sender, health_receiver) = watch::channel(false);
@@ -124,6 +128,7 @@ impl Backend {
             health_receiver,
             _backend_thread,
             padded_model,
+            supports_images,
             max_batch_size,
             model_type,
         })
@@ -295,6 +300,7 @@ impl Backend {
             max_length: tmp_length,
             pooled_indices,
             raw_indices: vec![],
+            images: vec![],
         }
     }
 
@@ -367,6 +373,7 @@ impl Backend {
             max_length,
             pooled_indices,
             raw_indices: vec![],
+            images: vec![],
         };
 
         match &self.model_type {
@@ -401,6 +408,7 @@ impl Backend {
                 max_length: 1,
                 pooled_indices: vec![0],
                 raw_indices: vec![],
+                images: vec![],
             };
             match &self.model_type {
                 ModelType::Classifier => self.predict(batch).await.map(|_| ()),
@@ -446,6 +454,7 @@ async fn init_backend(
     dtype: DType,
     model_type: ModelType,
     dense_path: Option<String>,
+    load_vision: bool,
     uds_path: String,
     otlp_endpoint: Option<String>,
     otlp_service_name: String,
@@ -555,11 +564,12 @@ async fn init_backend(
                 }
             };
 
-            let backend = CandleBackend::new(
+            let backend = CandleBackend::new_with_vision(
                 &model_path,
                 dtype.to_string(),
                 model_type.clone(),
                 dense_paths,
+                load_vision,
             );
             match backend {
                 Ok(b) => return Ok(Box::new(b)),

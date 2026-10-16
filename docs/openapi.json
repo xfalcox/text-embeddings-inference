@@ -969,6 +969,19 @@
           }
         }
       },
+      "Content": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TextContent"
+          },
+          {
+            "$ref": "#/components/schemas/ImageContent"
+          },
+          {
+            "$ref": "#/components/schemas/VideoContent"
+          }
+        ]
+      },
       "DecodeRequest": {
         "type": "object",
         "required": [
@@ -1210,6 +1223,20 @@
           "Empty"
         ]
       },
+      "ImageContent": {
+        "type": "object",
+        "required": [
+          "image"
+        ],
+        "properties": {
+          "image": {
+            "type": "string",
+            "description": "Base64-encoded image, optionally as a data URL e.g. `data:image/png;base64,...`",
+            "example": "data:image/png;base64,iVBORw0KGgo..."
+          }
+        },
+        "additionalProperties": false
+      },
       "Info": {
         "type": "object",
         "required": [
@@ -1348,6 +1375,9 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "$ref": "#/components/schemas/MultimodalInput"
           }
         ]
       },
@@ -1387,6 +1417,32 @@
             }
           }
         ]
+      },
+      "MultimodalContent": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Content"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "MultimodalInput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/MultimodalContent"
+          },
+          {
+            "$ref": "#/components/schemas/Content"
+          }
+        ],
+        "description": "Image, video or text input, or a list of those to be embedded together, in order"
       },
       "OpenAICompatEmbedding": {
         "type": "object",
@@ -1838,6 +1894,19 @@
           }
         }
       },
+      "TextContent": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "example": "What is Deep Learning?"
+          }
+        },
+        "additionalProperties": false
+      },
       "TokenizeInput": {
         "oneOf": [
           {
@@ -1900,6 +1969,26 @@
           "Left",
           "Right"
         ]
+      },
+      "VideoContent": {
+        "type": "object",
+        "required": [
+          "video"
+        ],
+        "properties": {
+          "video": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Base64-encoded video frames, optionally as data URLs e.g. `data:image/jpeg;base64,...`,\nideally sampled at 1 frame per second",
+            "example": [
+              "data:image/jpeg;base64,/9j/4AAQ...",
+              "data:image/jpeg;base64,/9j/4AAQ..."
+            ]
+          }
+        },
+        "additionalProperties": false
       }
     }
   },
