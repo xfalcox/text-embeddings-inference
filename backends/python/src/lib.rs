@@ -73,6 +73,11 @@ impl Backend for PythonBackend {
     }
 
     fn embed(&self, batch: Batch) -> Result<Embeddings, BackendError> {
+        if !batch.images.is_empty() {
+            return Err(BackendError::Inference(
+                "Image and video inputs are only supported with the Candle backend".to_string(),
+            ));
+        }
         if !batch.raw_indices.is_empty() {
             return Err(BackendError::Inference(
                 "raw embeddings are not supported for the Python backend.".to_string(),
@@ -102,6 +107,11 @@ impl Backend for PythonBackend {
     }
 
     fn predict(&self, batch: Batch) -> Result<Predictions, BackendError> {
+        if !batch.images.is_empty() {
+            return Err(BackendError::Inference(
+                "Image and video inputs are only supported with the Candle backend".to_string(),
+            ));
+        }
         if !batch.raw_indices.is_empty() {
             return Err(BackendError::Inference(
                 "raw embeddings are not supported for the Python backend.".to_string(),

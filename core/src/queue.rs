@@ -124,6 +124,7 @@ fn queue_blocking_task(
                 let mut input_ids = Vec::with_capacity(max_batch_tokens);
                 let mut token_type_ids = Vec::with_capacity(max_batch_tokens);
                 let mut position_ids = Vec::with_capacity(max_batch_tokens);
+                let mut images = Vec::new();
 
                 let mut pooled_indices = Vec::with_capacity(capacity);
                 let mut raw_indices = Vec::with_capacity(capacity);
@@ -169,6 +170,7 @@ fn queue_blocking_task(
                     input_ids.extend(entry.encoding.input_ids);
                     token_type_ids.extend(entry.encoding.token_type_ids);
                     position_ids.extend(entry.encoding.position_ids);
+                    images.extend(entry.encoding.images);
 
                     current_tokens += entry_tokens;
                     metadata.push(entry.metadata);
@@ -195,6 +197,7 @@ fn queue_blocking_task(
                             max_length,
                             pooled_indices,
                             raw_indices,
+                            images,
                         },
                     ))
                 };

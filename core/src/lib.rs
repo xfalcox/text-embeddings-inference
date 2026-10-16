@@ -1,5 +1,6 @@
 pub mod download;
 pub mod infer;
+pub mod multimodal;
 pub mod queue;
 pub mod tokenization;
 

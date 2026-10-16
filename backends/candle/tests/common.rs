@@ -365,5 +365,6 @@ pub fn batch(encodings: Vec<Encoding>, pooled_indices: Vec<u32>, raw_indices: Ve
         max_length,
         pooled_indices,
         raw_indices,
+        images: vec![],
     }
 }

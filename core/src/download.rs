@@ -66,7 +66,23 @@ pub async fn download_artifacts(api: &ApiRepo, pool_config: bool) -> Result<Path
             err
         });
 
-    download_file(api, "config.json").await?;
+    let config_path = download_file(api, "config.json").await?;
+
+    // Download the processor configuration for multimodal models only, as it's required to
+    // preprocess the image and video inputs
+    let is_multimodal = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())
+        .is_some_and(|config| config.get("vision_config").is_some_and(|c| !c.is_null()));
+    if is_multimodal {
+        let _ = download_file(api, "processor_config.json")
+            .await
+            .map_err(|err| {
+                tracing::warn!("Download failed: {err}");
+                err
+            });
+    }
+
     let path = download_file(api, "tokenizer.json").await?;
 
     tracing::info!("Model artifacts downloaded in {:?}", start.elapsed());

@@ -3,6 +3,7 @@ use serde::de::{SeqAccess, Visitor};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::fmt::Formatter;
+use text_embeddings_core::multimodal::ContentPart;
 use text_embeddings_core::tokenization::EncodingInput;
 use utoipa::openapi::{RefOr, Schema};
 use utoipa::ToSchema;
@@ -278,6 +279,7 @@ pub(crate) struct RerankResponse(pub Vec<Rank>);
 pub(crate) enum InputType {
     String(String),
     Ids(Vec<u32>),
+    Multimodal(MultimodalInput),
 }
 
 impl InputType {
@@ -285,6 +287,14 @@ impl InputType {
         match self {
             InputType::String(s) => s.chars().count(),
             InputType::Ids(v) => v.len(),
+            InputType::Multimodal(input) => input
+                .parts()
+                .iter()
+                .map(|part| match part {
+                    Content::Text(TextContent { text }) => text.chars().count(),
+                    Content::Image(_) | Content::Video(_) => 0,
+                })
+                .sum(),
         }
     }
 }
@@ -294,8 +304,81 @@ impl From<InputType> for EncodingInput {
         match value {
             InputType::String(s) => Self::Single(s),
             InputType::Ids(v) => Self::Ids(v),
+            InputType::Multimodal(input) => Self::Multimodal(
+                input
+                    .into_parts()
+                    .into_iter()
+                    .map(|part| match part {
+                        Content::Text(TextContent { text }) => ContentPart::Text(text),
+                        Content::Image(ImageContent { image }) => ContentPart::Image(image),
+                        Content::Video(VideoContent { video }) => ContentPart::Video(video),
+                    })
+                    .collect(),
+            ),
         }
     }
+}
+
+/// Image, video or text input, or a list of those to be embedded together, in order
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(untagged)]
+pub(crate) enum MultimodalInput {
+    Content(MultimodalContent),
+    Single(Content),
+}
+
+impl MultimodalInput {
+    fn parts(&self) -> &[Content] {
+        match self {
+            MultimodalInput::Content(MultimodalContent { content }) => content,
+            MultimodalInput::Single(part) => std::slice::from_ref(part),
+        }
+    }
+
+    fn into_parts(self) -> Vec<Content> {
+        match self {
+            MultimodalInput::Content(MultimodalContent { content }) => content,
+            MultimodalInput::Single(part) => vec![part],
+        }
+    }
+}
+
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MultimodalContent {
+    pub content: Vec<Content>,
+}
+
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(untagged)]
+pub(crate) enum Content {
+    Text(TextContent),
+    Image(ImageContent),
+    Video(VideoContent),
+}
+
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TextContent {
+    #[schema(example = "What is Deep Learning?")]
+    pub text: String,
+}
+
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImageContent {
+    /// Base64-encoded image, optionally as a data URL e.g. `data:image/png;base64,...`
+    #[schema(example = "data:image/png;base64,iVBORw0KGgo...")]
+    pub image: String,
+}
+
+#[derive(Deserialize, ToSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VideoContent {
+    /// Base64-encoded video frames, optionally as data URLs e.g. `data:image/jpeg;base64,...`,
+    /// ideally sampled at 1 frame per second
+    #[schema(example = json!(["data:image/jpeg;base64,/9j/4AAQ...", "data:image/jpeg;base64,/9j/4AAQ..."]))]
+    pub video: Vec<String>,
 }
 
 #[derive(Deserialize, ToSchema)]

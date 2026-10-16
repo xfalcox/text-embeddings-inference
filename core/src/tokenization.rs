@@ -1,6 +1,8 @@
 /// Payload tokenization logic
+use crate::multimodal::{ContentPart, MultimodalConfig};
 use crate::TextEmbeddingsError;
 use std::collections::HashMap;
+use text_embeddings_backend::BatchImage;
 use tokenizers::tokenizer::Tokenizer;
 pub use tokenizers::Encoding as RawEncoding;
 use tokenizers::{TruncationDirection, TruncationParams, TruncationStrategy};
@@ -34,6 +36,7 @@ impl Tokenization {
         position_offset: usize,
         default_prompt: Option<String>,
         prompts: Option<HashMap<String, String>>,
+        multimodal: Option<MultimodalConfig>,
     ) -> Self {
         tracing::info!("Starting {workers} tokenization workers");
 
@@ -48,6 +51,7 @@ impl Tokenization {
                 let receiver_clone = receiver.clone();
                 let default_prompt_clone = default_prompt.clone();
                 let prompts_clone = prompts.clone();
+                let multimodal_clone = multimodal.clone();
                 std::thread::spawn(move || {
                     tokenizer_worker(
                         tokenizer_clone,
@@ -55,6 +59,7 @@ impl Tokenization {
                         position_offset,
                         default_prompt_clone,
                         prompts_clone,
+                        multimodal_clone,
                         receiver_clone,
                     )
                 });
@@ -174,6 +179,7 @@ fn tokenizer_worker(
     position_offset: usize,
     default_prompt: Option<String>,
     prompts: Option<HashMap<String, String>>,
+    multimodal: Option<MultimodalConfig>,
     receiver: async_channel::Receiver<TokenizerRequest>,
 ) {
     // Loop over requests
@@ -205,6 +211,7 @@ fn tokenizer_worker(
                             default_prompt_clone,
                             prompt_name,
                             prompts.as_ref(),
+                            multimodal.as_ref(),
                             &mut tokenizer,
                         ));
                     }
@@ -226,16 +233,20 @@ fn tokenizer_worker(
 
                         // It's possible that the user dropped its request resulting in a send error.
                         // We just discard the error
-                        let _ = response_tx.send(tokenize_input(
-                            inputs,
-                            add_special_tokens,
-                            max_input_length,
-                            None,
-                            default_prompt_clone,
-                            prompt_name,
-                            prompts.as_ref(),
-                            &mut tokenizer,
-                        ));
+                        let _ = response_tx.send(
+                            tokenize_input(
+                                inputs,
+                                add_special_tokens,
+                                max_input_length,
+                                None,
+                                default_prompt_clone,
+                                prompt_name,
+                                prompts.as_ref(),
+                                multimodal.as_ref(),
+                                &mut tokenizer,
+                            )
+                            .map(|(text, encoding, _)| (text, encoding)),
+                        );
                     }
                 })
             }
@@ -293,8 +304,9 @@ fn tokenize_input(
     default_prompt: Option<String>,
     prompt_name: Option<String>,
     prompts: Option<&HashMap<String, String>>,
+    multimodal: Option<&MultimodalConfig>,
     tokenizer: &mut Tokenizer,
-) -> Result<(Option<String>, RawEncoding), TextEmbeddingsError> {
+) -> Result<(Option<String>, RawEncoding, Vec<BatchImage>), TextEmbeddingsError> {
     let pre_prompt = prepare_pre_prompt(default_prompt, prompt_name, prompts)?;
 
     let input_chars = inputs.count_chars();
@@ -322,7 +334,7 @@ fn tokenize_input(
                 .with_truncation(truncate_params)?
                 .encode::<&str>(&s, add_special_tokens)?;
 
-            (Some(s), encoding)
+            (Some(s), encoding, vec![])
         }
         EncodingInput::Dual(s1, s2) => {
             if pre_prompt.is_some() {
@@ -336,6 +348,7 @@ fn tokenize_input(
                 tokenizer
                     .with_truncation(truncate_params)?
                     .encode::<(String, String)>((s1, s2), add_special_tokens)?,
+                vec![],
             )
         }
         // input is encoded -> convert to tokenizers Encoding
@@ -348,7 +361,7 @@ fn tokenize_input(
                     .with_truncation(truncate_params)?
                     .encode::<&str>(&pre_prompt, true)?;
 
-                (Some(pre_prompt), encoding)
+                (Some(pre_prompt), encoding, vec![])
             } else {
                 let text = tokenizer.decode(&ids, false)?;
 
@@ -356,8 +369,28 @@ fn tokenize_input(
                     .with_truncation(truncate_params)?
                     .encode::<&str>(&text, false)?;
 
-                (Some(text), encoding)
+                (Some(text), encoding, vec![])
             }
+        }
+        EncodingInput::Multimodal(parts) => {
+            let Some(multimodal) = multimodal else {
+                return Err(TextEmbeddingsError::Validation(
+                    "Image and video inputs are not supported, as the model is text-only or `--disable-vision` is set".to_string(),
+                ));
+            };
+
+            // NOTE: The prompt is prepended to the whole input, images included, as Sentence
+            // Transformers renders it as the system message
+            let mut text = pre_prompt.unwrap_or_default();
+            let images = multimodal.prepare(parts, &mut text)?;
+
+            // NOTE: Multimodal inputs are never truncated, as it could split the placeholder
+            // tokens of an image
+            let encoding = tokenizer
+                .with_truncation(None)?
+                .encode::<&str>(&text, add_special_tokens)?;
+
+            (Some(text), encoding, images)
         }
     };
     Ok(encoding)
@@ -374,6 +407,7 @@ fn encode_input(
     default_prompt: Option<String>,
     prompt_name: Option<String>,
     prompts: Option<&HashMap<String, String>>,
+    multimodal: Option<&MultimodalConfig>,
     tokenizer: &mut Tokenizer,
 ) -> Result<ValidEncoding, TextEmbeddingsError> {
     // Default truncation params
@@ -384,7 +418,7 @@ fn encode_input(
         stride: 0,
     });
 
-    let (_, encoding) = tokenize_input(
+    let (_, encoding, images) = tokenize_input(
         inputs,
         true,
         max_input_length,
@@ -392,13 +426,19 @@ fn encode_input(
         default_prompt,
         prompt_name,
         prompts,
+        multimodal,
         tokenizer,
     )?;
     let seq_len = encoding.len();
 
     if seq_len > max_input_length {
+        let reason = if images.is_empty() {
+            String::new()
+        } else {
+            " (inputs with images or videos are never truncated)".to_string()
+        };
         return Err(TextEmbeddingsError::Validation(format!(
-            "`inputs` must have less than {max_input_length} tokens. Given: {seq_len}"
+            "`inputs` must have less than {max_input_length} tokens{reason}. Given: {seq_len}"
         )));
     }
     let histogram = metrics::histogram!("te_request_input_length");
@@ -408,6 +448,7 @@ fn encode_input(
         token_type_ids: encoding.get_type_ids().to_vec(),
         position_ids: (position_offset as u32..(seq_len + position_offset) as u32)
             .collect::<Vec<_>>(),
+        images,
     })
 }
 
@@ -416,6 +457,8 @@ pub struct ValidEncoding {
     pub input_ids: Vec<u32>,
     pub token_type_ids: Vec<u32>,
     pub position_ids: Vec<u32>,
+    /// Preprocessed images and video frames, in the same order as their placeholder tokens
+    pub images: Vec<BatchImage>,
 }
 
 #[derive(Debug)]
@@ -423,6 +466,8 @@ pub enum EncodingInput {
     Single(String),
     Dual(String, String),
     Ids(Vec<u32>),
+    /// Text interleaved with images and videos, in order
+    Multimodal(Vec<ContentPart>),
 }
 
 impl EncodingInput {
@@ -431,6 +476,10 @@ impl EncodingInput {
             EncodingInput::Single(s) => s.is_empty(),
             EncodingInput::Dual(s1, s2) => s1.is_empty() && s2.is_empty(),
             EncodingInput::Ids(v) => v.is_empty(),
+            EncodingInput::Multimodal(parts) => parts.iter().all(|part| match part {
+                ContentPart::Text(s) => s.is_empty(),
+                ContentPart::Image(_) | ContentPart::Video(_) => false,
+            }),
         }
     }
 
@@ -439,6 +488,14 @@ impl EncodingInput {
             EncodingInput::Single(s) => s.chars().count(),
             EncodingInput::Dual(s1, s2) => s1.chars().count() + s2.chars().count(),
             EncodingInput::Ids(v) => v.len(),
+            // NOTE: Only the text is counted, as images and videos are bounded on their own
+            EncodingInput::Multimodal(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text(s) => s.chars().count(),
+                    ContentPart::Image(_) | ContentPart::Video(_) => 0,
+                })
+                .sum(),
         }
     }
 
@@ -457,7 +514,7 @@ impl EncodingInput {
                 truncate_string(s1, limit / 2);
                 truncate_string(s2, limit / 2);
             }
-            EncodingInput::Ids(_) => {}
+            EncodingInput::Ids(_) | EncodingInput::Multimodal(_) => {}
         }
     }
 }
