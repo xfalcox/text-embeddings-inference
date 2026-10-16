@@ -113,8 +113,16 @@ pub async fn run(
     // Load config
     let config_path = model_root.join("config.json");
     let config = fs::read_to_string(config_path).context("`config.json` not found")?;
-    let config: ModelConfig =
+    let mut config: ModelConfig =
         serde_json::from_str(&config).context("Failed to parse `config.json`")?;
+    // NOTE: Multimodal models such as EmbeddingGemma 2 define the text backbone attributes within
+    // the nested `text_config` instead
+    if let Some(text_config) = config.text_config.take() {
+        config.max_position_embeddings = config
+            .max_position_embeddings
+            .or(text_config.max_position_embeddings);
+        config.pad_token_id = config.pad_token_id.or(text_config.pad_token_id);
+    }
 
     // Set model type from config
     let backend_model_type = get_backend_model_type(&config, &model_root, pooling)?;
@@ -210,10 +218,10 @@ pub async fn run(
         },
     };
 
-    let base_input_length = match st_config {
-        Some(config) => config.max_seq_length,
+    let base_input_length = match st_config.and_then(|config| config.max_seq_length) {
+        Some(max_seq_length) => max_seq_length,
         None => {
-            tracing::warn!("Could not find a Sentence Transformers config");
+            tracing::warn!("Could not find `max_seq_length` in the Sentence Transformers config");
             max_position_embeddings - position_offset
         }
     };
@@ -271,10 +279,12 @@ pub async fn run(
         prompts,
     );
 
-    // NOTE: `gemma3_text` won't support Float16 but only Float32, given that with `candle-cuda`
-    // feature, the default `Dtype::Float16` this overrides that to prevent issues when running a
-    // `gemma3_text` model without specifying a `--dtype`
-    let dtype = if dtype.is_none() && config.model_type == "gemma3_text" {
+    // NOTE: `gemma3_text` and `embedding_gemma2` won't support Float16 but only Float32, given
+    // that with `candle-cuda` feature, the default `Dtype::Float16` this overrides that to prevent
+    // issues when running those models without specifying a `--dtype`
+    let dtype = if dtype.is_none()
+        && (config.model_type == "gemma3_text" || config.model_type == "embedding_gemma2")
+    {
         DType::Float32
     } else {
         dtype.unwrap_or_default()
@@ -480,20 +490,42 @@ pub struct ModelConfig {
     pub id2label: Option<HashMap<String, String>>,
     pub label2id: Option<HashMap<String, usize>>,
     pub auto_map: Option<HashMap<String, String>>,
+    pub text_config: Option<TextConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TextConfig {
+    pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub pad_token_id: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PoolConfig {
+    #[serde(default)]
     pooling_mode_cls_token: bool,
+    #[serde(default)]
     pooling_mode_mean_tokens: bool,
     #[serde(default)]
     pooling_mode_lasttoken: bool,
+    /// Since Sentence Transformers v6, the pooling is defined as e.g. `"pooling_mode": "mean"`
+    /// instead of the `pooling_mode_*` boolean flags
+    #[serde(default)]
+    pooling_mode: Option<String>,
 }
 
 impl TryFrom<PoolConfig> for Pool {
     type Error = anyhow::Error;
 
     fn try_from(config: PoolConfig) -> std::result::Result<Self, Self::Error> {
+        if let Some(pooling_mode) = &config.pooling_mode {
+            return match pooling_mode.as_str() {
+                "cls" => Ok(Pool::Cls),
+                "mean" => Ok(Pool::Mean),
+                "lasttoken" => Ok(Pool::LastToken),
+                _ => Err(anyhow!("Pooling config {config:?} is not supported")),
+            };
+        }
         if config.pooling_mode_cls_token {
             return Ok(Pool::Cls);
         }
@@ -509,7 +541,7 @@ impl TryFrom<PoolConfig> for Pool {
 
 #[derive(Debug, Deserialize)]
 pub struct STConfig {
-    pub max_seq_length: usize,
+    pub max_seq_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -815,15 +815,29 @@ async fn download_onnx(api: Arc<ApiRepo>) -> Result<Vec<PathBuf>, ApiError> {
 
 #[cfg(feature = "candle")]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(from = "String")]
 enum ModuleType {
-    #[serde(rename = "sentence_transformers.models.Dense")]
     Dense,
-    #[serde(rename = "sentence_transformers.models.Normalize")]
     Normalize,
-    #[serde(rename = "sentence_transformers.models.Pooling")]
     Pooling,
-    #[serde(rename = "sentence_transformers.models.Transformer")]
     Transformer,
+    Other,
+}
+
+#[cfg(feature = "candle")]
+impl From<String> for ModuleType {
+    // NOTE: Matches on the class name only, as the module path differs between Sentence
+    // Transformers versions, e.g. `sentence_transformers.models.Dense` before v6 and
+    // `sentence_transformers.base.modules.dense.Dense` since v6
+    fn from(module_type: String) -> Self {
+        match module_type.rsplit('.').next() {
+            Some("Dense") => Self::Dense,
+            Some("Normalize") => Self::Normalize,
+            Some("Pooling") => Self::Pooling,
+            Some("Transformer") => Self::Transformer,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[cfg(feature = "candle")]

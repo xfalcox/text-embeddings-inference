@@ -105,15 +105,28 @@ pub fn sort_embeddings(embeddings: Embeddings) -> (Vec<Vec<f32>>, Vec<Vec<f32>>)
 }
 
 #[derive(Deserialize, PartialEq)]
+#[serde(from = "String")]
 enum ModuleType {
-    #[serde(rename = "sentence_transformers.models.Dense")]
     Dense,
-    #[serde(rename = "sentence_transformers.models.Normalize")]
     Normalize,
-    #[serde(rename = "sentence_transformers.models.Pooling")]
     Pooling,
-    #[serde(rename = "sentence_transformers.models.Transformer")]
     Transformer,
+    Other,
+}
+
+impl From<String> for ModuleType {
+    // NOTE: Matches on the class name only, as the module path differs between Sentence
+    // Transformers versions, e.g. `sentence_transformers.models.Dense` before v6 and
+    // `sentence_transformers.base.modules.dense.Dense` since v6
+    fn from(module_type: String) -> Self {
+        match module_type.rsplit('.').next() {
+            Some("Dense") => Self::Dense,
+            Some("Normalize") => Self::Normalize,
+            Some("Pooling") => Self::Pooling,
+            Some("Transformer") => Self::Transformer,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Deserialize)]
